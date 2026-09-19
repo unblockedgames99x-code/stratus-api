@@ -3,20 +3,45 @@ const { randomUUID, createDecipheriv } = require("crypto");
 const { readFileSync } = require("fs");
 const { WebSocketServer, WebSocket } = require("ws");
 const { createServer } = require("http");
+const { Readable } = require("stream");
 const dns = require("dns");
 const path = require("path");
 const chalk = require("chalk");
 
 if (!globalThis.crypto) globalThis.crypto = require("crypto").webcrypto;
 
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3001;
+const MUSIC_UPSTREAM_ORIGIN = "https://drfrost.site";
+const MUSIC_TIMEOUT_MS = 25_000;
+const GAME_DOCUMENT_TIMEOUT_MS = 15_000;
+const GAME_DOCUMENT_MAX_BYTES = 3 * 1024 * 1024;
 
 let sites;
-try {
-  sites = JSON.parse(readFileSync("sites.json", "utf-8"));
-} catch (e) {
-  console.error("Failed to load sites.json:", e);
-  process.exit(1);
+const environmentApiKey = String(process.env.STRATUS_API_KEY || "").trim();
+if (environmentApiKey) {
+  sites = {
+    sites: {
+      neo: {
+        api_key: environmentApiKey,
+        enabled: true,
+        max_concurrent_sessions: Number(process.env.MAX_CONCURRENT_SESSIONS) || 4,
+        max_session_seconds: Number(process.env.MAX_SESSION_SECONDS) || 900,
+        limits: {
+          per_minute: Number(process.env.RATE_LIMIT_PER_MINUTE) || 60,
+          per_hour: Number(process.env.RATE_LIMIT_PER_HOUR) || 1000,
+          per_day: Number(process.env.RATE_LIMIT_PER_DAY) || 10000,
+          per_month: Number(process.env.RATE_LIMIT_PER_MONTH) || 100000,
+        },
+      },
+    },
+  };
+} else {
+  try {
+    sites = JSON.parse(readFileSync("sites.json", "utf-8"));
+  } catch (e) {
+    console.error("Failed to load sites.json:", e);
+    process.exit(1);
+  }
 }
 
 const RACCOON_HOST = "www.raccoongame.com";
@@ -724,6 +749,24 @@ function auth(req, res, next) {
 
 const app = express();
 
+app.set("trust proxy", 1);
+
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Accept, Content-Type, Range, X-API-Key",
+  );
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Accept-Ranges, Content-Length, Content-Range, Content-Type",
+  );
+  res.setHeader("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 app.use((req, res, next) => {
@@ -743,6 +786,197 @@ app.use((req, res, next) => {
 });
 
 app.use(express.static(path.join(__dirname, "public")));
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "neo-stratus-api" });
+});
+
+function trustedGameDocumentUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || ""));
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.username || url.password) return null;
+  const host = url.hostname.toLowerCase();
+  if (host === "a.luminsdk.com" && /^\/g\/[A-Za-z0-9_-]+\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]+\/?$/.test(url.pathname)) return url;
+  if (host === "rawcdn.githack.com" && /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9]+\/.+\.html?$/i.test(url.pathname)) return url;
+  if (/^(?:cdn|fastly|gcore|quantil)\.jsdelivr\.net$/.test(host) && /^\/gh\/unblockedgames99x-code\/[A-Za-z0-9_.-]+@[0-9a-f]{40}\/.+\.html?$/i.test(url.pathname)) return url;
+  return null;
+}
+
+function gameResourceIsAd(value, baseUrl) {
+  let url;
+  try {
+    url = new URL(String(value || ""), baseUrl);
+  } catch {
+    return false;
+  }
+  const host = url.hostname.toLowerCase().replace(/^www\./, "");
+  if (host === "a.luminsdk.com" && url.pathname === "/js/all.min.js") return true;
+  if (
+    host === "cdn.r9x.in" ||
+    host === "googletagmanager.com" ||
+    host.endsWith(".googletagmanager.com") ||
+    host === "googlesyndication.com" ||
+    host.endsWith(".googlesyndication.com") ||
+    host === "doubleclick.net" ||
+    host.endsWith(".doubleclick.net") ||
+    host === "googleadservices.com" ||
+    host.endsWith(".googleadservices.com") ||
+    host === "adsterra.com" ||
+    host.endsWith(".adsterra.com") ||
+    host === "monetag.com" ||
+    host.endsWith(".monetag.com")
+  ) return true;
+  return /(?:^|\/)(?:ads?|advert(?:s|ising)?|popunder|prebid)(?:[._/-]|$)|ailogic[_-]|adsbygoogle/i.test(url.pathname + url.search);
+}
+
+function sanitizeGameDocument(source, sourceUrl) {
+  let html = String(source || "");
+  html = html.replace(/<meta\b[^>]*http-equiv\s*=\s*["']Content-Security-Policy["'][^>]*>/gi, "");
+  html = html.replace(/<script\b([^>]*)>[\s\S]*?<\/script\s*>/gi, (tag, attributes) => {
+    const src = String(attributes || "").match(/\bsrc\s*=\s*(?:(["'])(.*?)\1|([^\s>]+))/i);
+    if (src && gameResourceIsAd(src[2] || src[3], sourceUrl)) return "";
+    if (!src && /(?:googletagmanager|google-analytics|adsbygoogle|adbreak|adConfig|showRewardedAd|showInterstitial|r9x\.in|window\.dataLayer|function\s+gtag)/i.test(tag)) return "";
+    return tag;
+  });
+  html = html.replace(/<(?:link|iframe|embed)\b[^>]*(?:href|src)\s*=\s*(?:(["'])(.*?)\1|([^\s>]+))[^>]*>/gi, (tag, _quote, quoted, bare) => (
+    gameResourceIsAd(quoted || bare, sourceUrl) ? "" : tag
+  ));
+  const base = `<base href="${sourceUrl.href.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}" target="_self">`;
+  if (/<head(?:\s[^>]*)?>/i.test(html)) {
+    html = html.replace(/<head(?:\s[^>]*)?>/i, head => head + base);
+  } else {
+    html = `<!doctype html><html><head>${base}</head><body>${html}</body></html>`;
+  }
+  return html;
+}
+
+app.get("/games/v1/document", async (req, res) => {
+  const sourceUrl = trustedGameDocumentUrl(req.query.url);
+  if (!sourceUrl) return res.status(400).json({ error: "Invalid game document URL." });
+  try {
+    const upstream = await fetchWithTimeout(sourceUrl, {
+      cache: "no-store",
+      redirect: "error",
+      headers: {
+        Accept: "text/html,application/xhtml+xml;q=0.9",
+        "User-Agent": "NEO-OS-Game-Document/1.0",
+      },
+    }, GAME_DOCUMENT_TIMEOUT_MS);
+    const type = String(upstream.headers.get("content-type") || "");
+    const length = Number(upstream.headers.get("content-length") || 0);
+    if (!upstream.ok || !/\b(?:text\/html|application\/xhtml\+xml)\b/i.test(type)) {
+      return res.status(502).json({ error: "The game document is unavailable." });
+    }
+    if (length > GAME_DOCUMENT_MAX_BYTES) {
+      return res.status(413).json({ error: "The game document is too large." });
+    }
+    const source = await upstream.text();
+    if (Buffer.byteLength(source, "utf8") > GAME_DOCUMENT_MAX_BYTES) {
+      return res.status(413).json({ error: "The game document is too large." });
+    }
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("X-NEO-Game-Ad-Shield", "sanitized");
+    res.send(sanitizeGameDocument(source, sourceUrl));
+  } catch {
+    res.status(502).json({ error: "The game document is unavailable." });
+  }
+});
+
+function copyMusicHeaders(upstream, res, names) {
+  for (const name of names) {
+    const value = upstream.headers.get(name);
+    if (value) res.setHeader(name, value);
+  }
+  res.setHeader("X-Content-Type-Options", "nosniff");
+}
+
+function pipeMusicBody(upstream, req, res) {
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+  const body = Readable.fromWeb(upstream.body);
+  res.on("close", () => {
+    if (!res.writableEnded) body.destroy();
+  });
+  body.on("error", () => {
+    if (!res.headersSent) res.status(502).json({ error: "Music service is unavailable." });
+    else res.destroy();
+  });
+  body.pipe(res);
+}
+
+async function relayMusicCatalog(req, res, route) {
+  const query = String(req.query.q || "").trim();
+  const isSearch = route === "search";
+  if (isSearch && (!query || query.length > 120)) {
+    return res.status(400).json({ error: "Enter a valid search." });
+  }
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit) || (isSearch ? 20 : 10)));
+  const upstreamUrl = new URL(`/api/music/ytm/${route}`, MUSIC_UPSTREAM_ORIGIN);
+  if (isSearch) upstreamUrl.searchParams.set("q", query);
+  upstreamUrl.searchParams.set("limit", String(limit));
+
+  try {
+    const upstream = await fetchWithTimeout(upstreamUrl, {
+      headers: { Accept: "text/event-stream" },
+    }, MUSIC_TIMEOUT_MS);
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({ error: "Music catalog is unavailable." });
+    }
+    res.status(upstream.status);
+    copyMusicHeaders(upstream, res, ["Cache-Control", "Content-Type"]);
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+    pipeMusicBody(upstream, req, res);
+  } catch (error) {
+    if (!res.headersSent) res.status(502).json({ error: "Music catalog is unavailable." });
+    else res.destroy();
+  }
+}
+
+app.get("/music/v1/search", (req, res) => relayMusicCatalog(req, res, "search"));
+app.get("/music/v1/home", (req, res) => relayMusicCatalog(req, res, "home"));
+
+app.get("/music/v1/audio/:id", async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!/^[A-Za-z0-9_-]{6,20}$/.test(id)) {
+    return res.status(400).json({ error: "Invalid track." });
+  }
+
+  const headers = { Accept: "audio/mp4,audio/*;q=0.9,*/*;q=0.1" };
+  if (req.headers.range) headers.Range = String(req.headers.range);
+  try {
+    const upstream = await fetchWithTimeout(
+      `${MUSIC_UPSTREAM_ORIGIN}/api/sp/audio/${encodeURIComponent(id)}`,
+      { headers },
+      MUSIC_TIMEOUT_MS,
+    );
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({ error: "Audio is unavailable." });
+    }
+    res.status(upstream.status);
+    copyMusicHeaders(upstream, res, [
+      "Accept-Ranges",
+      "Cache-Control",
+      "Content-Length",
+      "Content-Range",
+      "Content-Type",
+    ]);
+    if (!res.getHeader("Cache-Control")) res.setHeader("Cache-Control", "public, max-age=300");
+    pipeMusicBody(upstream, req, res);
+  } catch (error) {
+    if (!res.headersSent) res.status(502).json({ error: "Audio is unavailable." });
+    else res.destroy();
+  }
+});
 
 app.get("/cloud/v1/embed", (req, res) => {
   if (!req.query.id) {
@@ -1174,5 +1408,7 @@ httpServer.listen(PORT, () => {
 
   console.log("");
 
-  fillPool().catch(() => {});
+  if (process.env.DISABLE_ACCOUNT_PREFILL !== "1") {
+    fillPool().catch(() => {});
+  }
 });
